@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"reflect"
 )
 
 const (
@@ -41,7 +42,7 @@ func toString(s interface{}) string {
 }
 
 // Run 3LO authorization flow.
-func authorizeFlow(secret map[string]interface{}, scope string, handler func(string) (string, error)) (string, error) {
+func (c *ThreeLeggedClient) authorizeFlow() (string, error) {
 	// Marshaw a url to be printed on console. In web based oauth flow, the
 	// browser should redirect the user to this url
 	params := url.Values{
@@ -50,22 +51,22 @@ func authorizeFlow(secret map[string]interface{}, scope string, handler func(str
 		"redirect_uri":                []string{oobCallbackUrn},
 		"response_type":               []string{"code"},
 		"client_id":                   nil,
-		"scope":                       []string{scope},
+		"scope":                       []string{c.scope},
 		"project_id":                  nil,
 	}
 
 	for key := range params {
-		if val, ok := secret[key]; ok {
+		if val, ok := c.secret[key]; ok {
 			params.Set(key, toString(val))
 		}
 	}
 
 	// Call the handler function to handle the authorize url and get back
 	// the verification code.
-	return handler(toString(secret["auth_uri"]) + "?" + params.Encode())
+	return c.authorizeHandler(toString(c.secret["auth_uri"]) + "?" + params.Encode())
 }
 
-func retrieveAccessToken(url string, params url.Values) (*Token, error) {
+func (c *ClientBase)retrieveAccessToken(url string, params url.Values) (*Token, error) {
 	response, err := http.PostForm(url, params)
 	if err != nil {
 		return nil, err
@@ -87,25 +88,35 @@ func retrieveAccessToken(url string, params url.Values) (*Token, error) {
 		token.Expiry = time.Unix(expiry, 0)
 		token.ExpiresIn = nil
 	}
+
+	var storedToken StoredToken
+	storedToken.TokenValue = token
+	storedToken.Secret = c.secret
+	storedToken.Scope = c.scope
+
+	if jsonStr, err := json.MarshalIndent(storedToken, "", "  "); err == nil {
+		c.store.Put(jsonStr)
+	}
+
 	return token, nil
 }
 
 // Run 3LO verification. Sends a request to auth_uri with a verification code.
-func verifyFlow(secret map[string]interface{}, scope string, code string) (*Token, error) {
+func (c *ThreeLeggedClient)verifyFlow(code string) (*Token, error) {
 	// Construct a POST request to fetch OAuth token with the verificaton code.
 	params := url.Values{
-		"client_id":    []string{toString(secret["client_id"])},
+		"client_id":    []string{toString(c.secret["client_id"])},
 		"code":         []string{code},
-		"scope":        []string{scope},
+		"scope":        []string{c.scope},
 		"grant_type":   []string{"authorization_code"},
 		"redirect_uri": []string{oobCallbackUrn},
 	}
-	if clientSecret, ok := secret["client_secret"]; ok {
+	if clientSecret, ok := c.secret["client_secret"]; ok {
 		params.Set("client_secret", toString(clientSecret))
 	}
 
 	// Send the POST request and return token.
-	return retrieveAccessToken(toString(secret["token_uri"]), params)
+	return c.retrieveAccessToken(toString(c.secret["token_uri"]), params)
 }
 
 // Helper struct used in sign JWT
@@ -135,7 +146,7 @@ func mapToJsonBase64(m map[string]string) (string, error) {
 }
 
 // Creates a JWT token for 2LO token request.
-func createJWT(secret map[string]interface{}, scope string, pkey pkeyInterface) (string, error) {
+func (c *TwoLeggedClient)createJWT(pkey pkeyInterface) (string, error) {
 	// A valid JWT has an "iat" timestamp and an "exp" timestamp. Get the current
 	// time to create these timestamps.
 	now := int(time.Now().Unix())
@@ -145,16 +156,16 @@ func createJWT(secret map[string]interface{}, scope string, pkey pkeyInterface) 
 	header := map[string]string{
 		"typ": "JWT",
 		"alg": "RS256",
-		"kid": toString(secret["private_key_id"]),
+		"kid": toString(c.secret["private_key_id"]),
 	}
 
 	// Construct the JWT payload.
 	payload := map[string]string{
-		"aud":   toString(secret["token_uri"]),
-		"scope": scope,
+		"aud":   toString(c.secret["token_uri"]),
+		"scope": c.scope,
 		"iat":   strconv.Itoa(now),
 		"exp":   strconv.Itoa(now + 3600),
-		"iss":   toString(secret["client_email"]),
+		"iss":   toString(c.secret["client_email"]),
 	}
 
 	// Convert header and payload to base64-encoded JSON.
@@ -183,42 +194,99 @@ func createJWT(secret map[string]interface{}, scope string, pkey pkeyInterface) 
 	return segments + "." + base64Encode(signedBytes), nil
 }
 
+func (c *ClientBase) readTokenStore() (*Token, error) {
+	bytes, err := c.store.Get()
+	if (err != nil) {
+		return nil, err
+	}
+
+	var storedToken StoredToken
+	if err := json.Unmarshal(bytes, &storedToken); err != nil {
+		return nil, err
+	}
+
+	if !reflect.DeepEqual(storedToken.Secret, c.secret) || storedToken.Scope != c.scope {
+		return nil, fmt.Errorf("Cached token having different secret or scope.")
+	}
+
+	expiry := storedToken.TokenValue.Expiry
+	if time.Now().Before(expiry) {
+		return storedToken.TokenValue, nil
+	} else {
+		return nil, fmt.Errorf("Cached token expired.")
+	}
+}
+
 // Client interface for OAuth 2.
 type Client interface {
-	// Get an OAuth 2 token for the specified OAuth scope. This method
+	// GetToken gets an OAuth 2 token for the specified OAuth scope. This method
 	// must be safe for concurrent use by multiple goroutines.
 	//
-	// scope: A space separated scope codes per
-	//     [OAuth 2.0 spec](https://tools.ietf.org/html/rfc6749).
 	// returns: A Token object including both refreash token and access
 	//     token. The returned Token must **not** be modified.
-	GetToken(scope string) (*Token, error)
+	GetToken() (*Token, error)
+
+	// SetStore sets TokenStore to the current Client.
+	SetStore(store TokenStore)
+
+	// SetAuthorizeHandler sets the authorize flow handler to Client.
+	// AuthorizeHandler is a function that handles 3LO authorization flow. It
+	// take in an auth URL, let the user authorize access on that URL, and return
+	// an verification code. If it is nil, the client will use the
+	// defaultAuthorizeFlowHandler.
+	SetAuthorizeHandler(handler func(string) (string, error))
 }
 
-type TwoLeggedClient struct {
+type ClientBase struct {
 	secret map[string]interface{}
-}
-
-type ThreeLeggedClient struct {
-	secret           map[string]interface{}
+	scope string
+	store TokenStore
 	authorizeHandler func(string) (string, error)
 }
 
+func (c *ClientBase) SetStore(s TokenStore) {
+	c.store = s
+}
+
+func (c *ClientBase) SetAuthorizeHandler(h func(string) (string, error)) {
+	c.authorizeHandler = h
+}
+
+type TwoLeggedClient struct {
+	ClientBase
+}
+
+type ThreeLeggedClient struct {
+	ClientBase
+}
+
 // Run 3LO flow, including a authorize flow and a verify flow.
-func (c ThreeLeggedClient) GetToken(scope string) (*Token, error) {
+func (c *ThreeLeggedClient) GetToken() (*Token, error) {
+	// Check token store.
+	token, err := c.readTokenStore()
+	if err == nil {
+		return token, nil
+	}
+
 	// In the authorize flow, user will paste a verification code back to console.
-	code, err := authorizeFlow(c.secret, scope, c.authorizeHandler)
+	code, err := c.authorizeFlow()
 	if err != nil {
 		return nil, err
 	}
 
 	// The verify flow takes in the verification code from authorize flow, sends a
 	// POST request containing the code to fetch oauth token.
-	return verifyFlow(c.secret, scope, code)
+	return c.verifyFlow(code)
 }
 
 // Run 2LO flow. Create a JWT token and use it to fetch an OAuth token.
-func (c TwoLeggedClient) GetToken(scope string) (*Token, error) {
+func (c *TwoLeggedClient) GetToken() (*Token, error) {
+	// Check token store.
+	token, err := c.readTokenStore()
+	if err == nil {
+		return token, nil
+	}
+
 	// Read the private key in service account secret.
 	pemBytes := []byte(toString(c.secret["private_key"]))
 	block, _ := pem.Decode(pemBytes)
@@ -240,7 +308,7 @@ func (c TwoLeggedClient) GetToken(scope string) (*Token, error) {
 	}
 
 	// Get the JWT token
-	jwt, err := createJWT(c.secret, scope, pkey)
+	jwt, err := c.createJWT(pkey)
 	if err != nil {
 		return nil, err
 	}
@@ -252,25 +320,20 @@ func (c TwoLeggedClient) GetToken(scope string) (*Token, error) {
 	}
 
 	// Send the POST request and return token.
-	return retrieveAccessToken(toString(c.secret["token_uri"]), params)
+	return c.retrieveAccessToken(toString(c.secret["token_uri"]), params)
 }
 
 // NewClient create a new OAuth2 Client.
 //
-// SecretBytes is a JSON string that represents either an OAuth client ID or a
+// secretBytes: a JSON string that represents either an OAuth client ID or a
 // service account.
-//
-// AuthorizeHandler is a function that handles 3LO authorization flow. It
-// take in an auth URL, let the user authorize access on that URL, and return
-// an verification code. If it is nil, the client will use the
-// defaultAuthorizeFlowHandler.
-func NewClient(secretBytes []byte, authorizeHandler func(string) (string, error)) (Client, error) {
+// scope: A space separated scope codes per
+//     [OAuth 2.0 spec](https://tools.ietf.org/html/rfc6749).
+
+func NewClient(secretBytes []byte, scope string) (Client, error) {
 	var secret map[string]interface{}
 	if err := json.Unmarshal(secretBytes, &secret); err != nil {
 		return nil, err
-	}
-	if authorizeHandler == nil {
-		authorizeHandler = defaultAuthorizeFlowHandler
 	}
 
 	// TODO: support "web" client secret by using a local web server.
@@ -283,10 +346,10 @@ func NewClient(secretBytes []byte, authorizeHandler func(string) (string, error)
 		if !ok {
 			return nil, fmt.Errorf("Malformatted secret json, expected map for param \"installed\"")
 		}
-		return ThreeLeggedClient{installedMap, authorizeHandler}, nil
+		return &ThreeLeggedClient{ClientBase{installedMap, scope, nil, defaultAuthorizeFlowHandler}}, nil
 	} else if tokenType, ok := secret["type"]; ok && "service_account" == tokenType {
 		// If the token type is "service_account", we will run the two-legged flow
-		return TwoLeggedClient{secret}, nil
+		return &TwoLeggedClient{ClientBase{secret, scope, nil, nil}}, nil
 	} else {
 		return nil, fmt.Errorf("Unsupported token type.")
 	}

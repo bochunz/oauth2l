@@ -4,15 +4,19 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/google/oauth2l/go/oauth2client"
 	"io/ioutil"
 	"strings"
+	"os/user"
+
+	"github.com/google/oauth2l/go/oauth2client"
 )
 
 const (
-	// Common prefix for google oauth scope
+	// Common prefix for google oauth scope.
 	scopePrefix = "https://www.googleapis.com/auth/"
 )
+
+var cacheFile string
 
 func help() {
 	fmt.Println("Usage: oauth2l --json <secret.json> " +
@@ -33,6 +37,22 @@ func token(token *oauth2client.Token) {
 		panic("Failed to covert token to json.")
 	}
 	fmt.Println(string(jsonStr))
+}
+
+type tokenStore struct {}
+
+func (s tokenStore) Get() ([]byte, error) {
+	return ioutil.ReadFile(cacheFile)
+}
+
+func (s tokenStore) Put(payload []byte) error {
+	return ioutil.WriteFile(cacheFile, payload, 0644)
+}
+
+func init() {
+	if usr, err:= user.Current(); err == nil {
+		cacheFile = usr.HomeDir + "/.oauth2l.cache.token"
+	}
 }
 
 func main() {
@@ -71,12 +91,14 @@ func main() {
 			scopes[i] = scopePrefix + scopes[i]
 		}
 	}
-	client, err := oauth2client.NewClient(secretBytes, nil)
+	client, err := oauth2client.NewClient(secretBytes, strings.Join(scopes, " "))
 	if err != nil {
 		fmt.Printf("Failed to create OAuth2 client: %s\n", err)
 		return
 	}
-	token, err := client.GetToken(strings.Join(scopes, " "))
+	store := tokenStore{}
+	client.SetStore(store)
+	token, err := client.GetToken()
 	if err != nil {
 		fmt.Printf("Error getting token: %s\n", err)
 		return
